@@ -14,7 +14,13 @@ from .serializers import (
     ArticleSerializer, ArticleListSerializer, ArticleSearchSerializer,
     ArticleCreateSerializer, SearchQuerySerializer, ArticleViewSerializer
 )
-from .tasks import generate_embedding_task
+from apps.services.article_service import ArticleService
+from apps.services.search_service import SearchService
+from apps.services.multimodal_service import multimodal_service
+from django.core.files.storage import default_storage
+from django.core.files.base import ContentFile
+import tempfile
+import os
 
 logger = logging.getLogger('articles')
 
@@ -62,28 +68,19 @@ class ArticleViewSet(viewsets.ModelViewSet):
         """Override retrieve to track article views"""
         instance = self.get_object()
         
-        # Track the view
-        self._track_article_view(request, instance)
-        
-        # Increment view counter
-        instance.increment_views()
+        # Track the view using service layer
+        ArticleService.track_article_view(
+            article=instance,
+            user=request.user if request.user.is_authenticated else None,
+            ip_address=self._get_client_ip(request),
+            user_agent=request.META.get('HTTP_USER_AGENT', ''),
+            referrer=request.META.get('HTTP_REFERER', '')
+        )
         
         serializer = self.get_serializer(instance)
         return Response(serializer.data)
     
-    def _track_article_view(self, request, article):
-        """Track article view for analytics"""
-        try:
-            ArticleView.objects.create(
-                article=article,
-                user=request.user if request.user.is_authenticated else None,
-                ip_address=self._get_client_ip(request),
-                user_agent=request.META.get('HTTP_USER_AGENT', ''),
-                referrer=request.META.get('HTTP_REFERER', '')
-            )
-        except Exception as e:
-            logger.error(f"Error tracking article view: {e}")
-    
+
     def _get_client_ip(self, request):
         """Get client IP address"""
         x_forwarded_for = request.META.get('HTTP_X_FORWARDED_FOR')
@@ -110,12 +107,14 @@ class ArticleViewSet(viewsets.ModelViewSet):
         limit = serializer.validated_data['limit']
         
         try:
-            if search_type == 'text':
-                results = self._full_text_search(query, category, language, limit)
-            elif search_type == 'semantic':
-                results = self._semantic_search(query, category, language, limit)
-            else:  # hybrid
-                results = self._hybrid_search(query, category, language, limit)
+            # Use SearchService for unified search
+            results = SearchService.search(
+                query=query,
+                search_type=search_type,
+                category=category,
+                language=language,
+                limit=limit
+            )
             
             serializer = ArticleSearchSerializer(results, many=True)
             return Response({
@@ -132,91 +131,7 @@ class ArticleViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_500_INTERNAL_SERVER_ERROR
             )
     
-    def _full_text_search(self, query, category=None, language=None, limit=20):
-        """Full-text search using PostgreSQL tsvector"""
-        search_query = SearchQuery(query)
-        
-        queryset = Article.objects.filter(
-            search_vector=search_query
-        ).annotate(
-            rank=SearchRank(F('search_vector'), search_query)
-        ).order_by('-rank')
-        
-        if category:
-            queryset = queryset.filter(category__iexact=category)
-        if language:
-            queryset = queryset.filter(language=language)
-        
-        return queryset[:limit]
-    
-    def _semantic_search(self, query, category=None, language=None, limit=20):
-        """Semantic search using embeddings"""
-        from sentence_transformers import SentenceTransformer
-        
-        # Generate query embedding
-        model = SentenceTransformer('all-MiniLM-L6-v2')
-        query_embedding = model.encode(query, normalize_embeddings=True).tolist()
-        
-        # Get articles with embeddings
-        queryset = Article.objects.exclude(embedding__isnull=True)
-        
-        if category:
-            queryset = queryset.filter(category__iexact=category)
-        if language:
-            queryset = queryset.filter(language=language)
-        
-        # Calculate similarity scores
-        articles_with_scores = []
-        for article in queryset[:1000]:  # Limit for performance
-            if article.embedding:
-                similarity = self._cosine_similarity(query_embedding, article.embedding)
-                if similarity > 0.3:  # Threshold for relevance
-                    article.similarity_score = similarity
-                    articles_with_scores.append(article)
-        
-        # Sort by similarity and return top results
-        articles_with_scores.sort(key=lambda x: x.similarity_score, reverse=True)
-        return articles_with_scores[:limit]
-    
-    def _hybrid_search(self, query, category=None, language=None, limit=20):
-        """Combine full-text and semantic search"""
-        # Get results from both methods
-        text_results = list(self._full_text_search(query, category, language, limit * 2))
-        semantic_results = list(self._semantic_search(query, category, language, limit * 2))
-        
-        # Combine and deduplicate
-        combined_results = {}
-        
-        # Add text search results with rank-based score
-        for i, article in enumerate(text_results):
-            score = (len(text_results) - i) / len(text_results)  # Normalize rank
-            article.similarity_score = score * 0.6  # Weight text search 60%
-            combined_results[article.id] = article
-        
-        # Add semantic search results
-        for article in semantic_results:
-            if article.id in combined_results:
-                # Combine scores
-                combined_results[article.id].similarity_score += article.similarity_score * 0.4
-            else:
-                article.similarity_score *= 0.4  # Weight semantic search 40%
-                combined_results[article.id] = article
-        
-        # Sort by combined score
-        final_results = list(combined_results.values())
-        final_results.sort(key=lambda x: x.similarity_score, reverse=True)
-        
-        return final_results[:limit]
-    
-    def _cosine_similarity(self, a, b):
-        """Calculate cosine similarity between two vectors"""
-        try:
-            a = np.array(a)
-            b = np.array(b)
-            return np.dot(a, b) / (np.linalg.norm(a) * np.linalg.norm(b))
-        except:
-            return 0.0
-    
+
     @action(detail=True, methods=['get'])
     def recommend(self, request, pk=None):
         """
@@ -230,22 +145,10 @@ class ArticleViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_404_NOT_FOUND
             )
         
-        # Find similar articles
-        similar_articles = []
-        queryset = Article.objects.exclude(pk=article.pk).exclude(embedding__isnull=True)
+        # Use ArticleService for recommendations
+        similar_articles = ArticleService.get_similar_articles(article, limit=10)
         
-        for other_article in queryset[:500]:  # Limit for performance
-            if other_article.embedding:
-                similarity = self._cosine_similarity(article.embedding, other_article.embedding)
-                if similarity > 0.5:  # Higher threshold for recommendations
-                    other_article.similarity_score = similarity
-                    similar_articles.append(other_article)
-        
-        # Sort by similarity
-        similar_articles.sort(key=lambda x: x.similarity_score, reverse=True)
-        
-        # Return top 10 recommendations
-        serializer = ArticleSearchSerializer(similar_articles[:10], many=True)
+        serializer = ArticleSearchSerializer(similar_articles, many=True)
         return Response({
             'article_id': article.id,
             'article_title': article.title,
@@ -256,11 +159,11 @@ class ArticleViewSet(viewsets.ModelViewSet):
     def share(self, request, pk=None):
         """Track article share"""
         article = self.get_object()
-        article.increment_shares()
+        total_shares = ArticleService.increment_shares(article.id)
         
         return Response({
             'message': 'Share tracked successfully',
-            'total_shares': article.shares
+            'total_shares': total_shares
         })
     
     @action(detail=False, methods=['get'])
@@ -273,3 +176,107 @@ class ArticleViewSet(viewsets.ModelViewSet):
             'trending_articles': trending_data,
             'period': '24 hours'
         })
+    
+    @action(detail=False, methods=['post'])
+    def search_by_image(self, request):
+        """
+        Search articles by uploaded image using CLIP embeddings
+        """
+        if 'image' not in request.FILES:
+            return Response({'error': 'No image provided'}, status=400)
+        
+        try:
+            image_file = request.FILES['image']
+            
+            # Generate embedding for uploaded image
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.jpg') as tmp_file:
+                for chunk in image_file.chunks():
+                    tmp_file.write(chunk)
+                tmp_file.flush()
+                
+                query_embedding = multimodal_service.generate_image_embedding(tmp_file.name)
+                os.unlink(tmp_file.name)
+            
+            if not query_embedding:
+                return Response({'error': 'Failed to process image'}, status=400)
+            
+            # Find similar articles with image embeddings
+            articles = Article.objects.exclude(image_embedding__isnull=True)
+            
+            results = []
+            for article in articles:
+                similarity = multimodal_service.cosine_similarity(
+                    query_embedding, article.image_embedding
+                )
+                if similarity > 0.7:  # Similarity threshold
+                    results.append({
+                        'article': article,
+                        'similarity': similarity
+                    })
+            
+            # Sort by similarity
+            results.sort(key=lambda x: x['similarity'], reverse=True)
+            
+            # Serialize results
+            serialized_results = []
+            for result in results[:10]:  # Top 10
+                article_data = self.get_serializer(result['article']).data
+                article_data['similarity'] = result['similarity']
+                serialized_results.append(article_data)
+            
+            return Response({
+                'results': serialized_results,
+                'count': len(serialized_results)
+            })
+            
+        except Exception as e:
+            return Response({'error': str(e)}, status=500)
+    
+    @action(detail=False, methods=['post'])
+    def search_by_text_to_image(self, request):
+        """
+        Search images by text description using CLIP
+        """
+        query = request.data.get('query', '').strip()
+        if not query:
+            return Response({'error': 'Query is required'}, status=400)
+        
+        try:
+            # Generate CLIP text embedding
+            query_embedding = multimodal_service.generate_text_embedding(query)
+            
+            if not query_embedding:
+                return Response({'error': 'Failed to process query'}, status=400)
+            
+            # Find articles with similar image embeddings
+            articles = Article.objects.exclude(image_embedding__isnull=True)
+            
+            results = []
+            for article in articles:
+                similarity = multimodal_service.cosine_similarity(
+                    query_embedding, article.image_embedding
+                )
+                if similarity > 0.6:  # Lower threshold for text-to-image
+                    results.append({
+                        'article': article,
+                        'similarity': similarity
+                    })
+            
+            # Sort by similarity
+            results.sort(key=lambda x: x['similarity'], reverse=True)
+            
+            # Serialize results
+            serialized_results = []
+            for result in results[:10]:
+                article_data = self.get_serializer(result['article']).data
+                article_data['similarity'] = result['similarity']
+                serialized_results.append(article_data)
+            
+            return Response({
+                'query': query,
+                'results': serialized_results,
+                'count': len(serialized_results)
+            })
+            
+        except Exception as e:
+            return Response({'error': str(e)}, status=500)

@@ -37,6 +37,38 @@ class Article(models.Model):
         help_text="768-dimensional embedding vector for semantic search"
     )
     
+    # Multimodal embeddings
+    image_embedding = ArrayField(
+        models.FloatField(),
+        size=512,
+        null=True,
+        blank=True,
+        help_text="CLIP image embedding for visual search"
+    )
+    
+    video_embedding = ArrayField(
+        models.FloatField(),
+        size=512,
+        null=True,
+        blank=True,
+        help_text="Video frame embedding for video search"
+    )
+    
+    # Media URLs
+    image_url = models.URLField(blank=True, help_text="Featured image URL")
+    video_url = models.URLField(blank=True, help_text="Video content URL")
+    media_type = models.CharField(
+        max_length=20,
+        choices=[
+            ('text', 'Text Only'),
+            ('image', 'With Image'),
+            ('video', 'With Video'),
+            ('mixed', 'Mixed Media')
+        ],
+        default='text',
+        db_index=True
+    )
+    
     search_vector = SearchVectorField(
         null=True,
         blank=True,
@@ -71,6 +103,8 @@ class Article(models.Model):
             models.Index(fields=['created_at']),
             # Analytics queries
             models.Index(fields=['views', 'published_at']),
+            # Media type queries
+            models.Index(fields=['media_type']),
         ]
         ordering = ['-published_at']
     

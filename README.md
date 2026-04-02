@@ -19,10 +19,12 @@ A modern news analytics platform built with Django and PostgreSQL advanced featu
 
 ### Architecture
 - **Django + DRF**: REST API backend
+- **Service Layer**: Clean business logic separation
 - **Celery**: Async task processing
 - **Redis**: Caching and message broker
 - **WebSockets**: Real-time updates
 - **Docker**: Containerized deployment
+- **ML Models**: Configurable embedding models for semantic search
 
 ## 📋 Prerequisites
 
@@ -65,6 +67,9 @@ docker-compose exec web python manage.py createsuperuser
 
 # Load sample data (optional)
 docker-compose exec web python manage.py load_sample_data
+
+# Generate embeddings for semantic search
+docker-compose exec web python manage.py switch_embedding_model fast --reindex
 ```
 
 ### 4. Access the Application
@@ -103,6 +108,67 @@ POST   /api/articles/{id}/predict/       # Engagement prediction
 ws://localhost:8000/ws/analytics/dashboard/        # Real-time dashboard
 ws://localhost:8000/ws/analytics/article/{id}/     # Article metrics
 ```
+
+## 🤖 Embedding Models & Configuration
+
+### Available Models
+
+The platform supports multiple embedding models optimized for different use cases:
+
+| Model | Size | Dimensions | Speed | Quality | Best For |
+|-------|------|------------|-------|---------|----------|
+| `fast` | 23MB | 384 | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐ | General purpose, development |
+| `balanced` | 33MB | 384 | ⭐⭐⭐⭐ | ⭐⭐⭐⭐ | Production balance |
+| `accurate` | 420MB | 768 | ⭐⭐ | ⭐⭐⭐⭐⭐ | High accuracy needs |
+| `qa` | 23MB | 384 | ⭐⭐⭐⭐⭐ | ⭐⭐⭐ | Q&A systems |
+| `search` | 23MB | 384 | ⭐⭐⭐⭐⭐ | ⭐⭐⭐⭐ | Search/retrieval |
+| `multilingual` | 470MB | 384 | ⭐⭐ | ⭐⭐⭐⭐ | Multi-language support |
+
+### Model Management
+
+```bash
+# List available models
+python manage.py switch_embedding_model list
+
+# Switch to a different model
+python manage.py switch_embedding_model balanced
+
+# Switch and reindex all articles
+python manage.py switch_embedding_model accurate --reindex
+
+# Force reindex with custom batch size
+python manage.py switch_embedding_model fast --reindex --force --batch-size 50
+```
+
+### Environment Configuration
+
+```bash
+# .env
+EMBEDDING_MODEL=fast          # Development
+EMBEDDING_MODEL=balanced      # Staging
+EMBEDDING_MODEL=accurate      # Production
+```
+
+## 🏗️ Service Layer Architecture
+
+The platform follows clean architecture principles with a dedicated service layer:
+
+```
+Views (Controllers) → Services (Business Logic) → Models (Data Layer)
+```
+
+### Service Classes
+
+- **EmbeddingService** (`apps/services/embedding_service.py`): ML model management
+- **ArticleService** (`apps/services/article_service.py`): Article business logic
+- **SearchService** (`apps/services/search_service.py`): Advanced search functionality
+
+### Benefits
+
+- ✅ **Clean separation** of concerns
+- ✅ **Testable** business logic
+- ✅ **Reusable** across different interfaces
+- ✅ **Maintainable** and scalable code
 
 ## 🔍 Search Examples
 
@@ -160,8 +226,9 @@ curl -X POST http://localhost:8000/api/articles/search/ \
 1. **Articles App**: Core article management and search
 2. **Analytics App**: Time-series analytics and dashboards
 3. **Users App**: User management and preferences
-4. **Celery Tasks**: Background processing (embeddings, analytics)
-5. **WebSocket Consumers**: Real-time updates
+4. **Service Layer**: Business logic (ArticleService, SearchService, EmbeddingService)
+5. **Celery Tasks**: Background processing (embeddings, analytics)
+6. **WebSocket Consumers**: Real-time updates
 
 ## 🔧 Development
 
@@ -255,6 +322,9 @@ ALLOWED_HOSTS=yourdomain.com,api.yourdomain.com
 # Celery
 CELERY_BROKER_URL=redis://redis-host:6379/0
 CELERY_RESULT_BACKEND=redis://redis-host:6379/0
+
+# Embedding Model
+EMBEDDING_MODEL=fast          # Options: fast, balanced, accurate, qa, search, multilingual
 ```
 
 ### Docker Production
@@ -308,11 +378,11 @@ docker-compose logs celery
 
 **Search Not Working**
 ```bash
-# Regenerate embeddings
-docker-compose exec web python manage.py generate_embeddings
+# Switch embedding model and reindex
+python manage.py switch_embedding_model fast --reindex
 
 # Check search indexes
-docker-compose exec web python manage.py check_search_indexes
+python manage.py shell -c "from apps.articles.models import Article; print(f'Articles with embeddings: {Article.objects.exclude(embedding__isnull=True).count()}/{Article.objects.count()}')"
 ```
 
 ### Performance Issues
@@ -331,7 +401,10 @@ docker-compose exec web python manage.py check_search_indexes
 
 For support and questions:
 - Create an issue on GitHub
-- Check the documentation
+- Check the documentation:
+  - [Data Pipeline Flow](DATA_PIPELINE_FLOW.md)
+  - [Embedding Models Guide](EMBEDDING_MODELS_GUIDE.md)
+  - [Service Layer Architecture](SERVICE_LAYER_ARCHITECTURE.md)
 - Review the API examples above
 
 ---
